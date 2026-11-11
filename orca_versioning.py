@@ -8,6 +8,9 @@
 # author = ""
 # version = "0.1.0"
 # ///
+# Required Notice: Copyright (c) 2026 Federico Ricchiuto (https://github.com/trane77/orca-versioning-plugin)
+# Licensed under the PolyForm Noncommercial License 1.0.0 (see LICENSE.md):
+# https://polyformproject.org/licenses/noncommercial/1.0.0 (no commercial use or resale)
 """A version is committed on every G-code export and every send to the printer.
 
 The triggers run on worker threads, but export_3mf_copy() only works on the UI thread. The worker

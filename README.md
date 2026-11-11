@@ -83,3 +83,7 @@ pip install dulwich && python test_orca_versioning.py
 - [ ] Two plates: export plate 1, then plate 2 → one version in each history, and the tab switches to the plate selected in OrcaSlicer (on `PlateSelected`, or when the tab gets focus again if that event isn't fired).
 - [ ] Moving an object on plate 2 and exporting plate 1 → no new plate 1 version.
 - [ ] Preset warning: with a process preset without "Version on export", a warning shows once (not on every slice) and the Versions tab shows the banner; picking a preset with it makes both go away.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md): you can use, study and modify the plugin for personal and other noncommercial purposes. Selling it, or using it for any commercial purpose, is not allowed without the author's permission. Any copy you pass on must keep the license and its `Required Notice` line.
