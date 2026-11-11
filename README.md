@@ -30,9 +30,18 @@ If the active preset wouldn't version exports, the plugin says so: a warning not
 
 ## Use
 
-The **Versions** tab shows the project's history. Every version goes on `main`: branches aren't in the UI for now (the core functions are still in the code, ready to be wired back). You can:
-- Click 1 version → **Tag…** or **Extract .3mf**. Extracting writes `<project>@<tag|sha>.3mf` next to the project, ready to open. To restore a version, use Extract .3mf.
-- Click 2 versions → **Diff** of settings, objects and geometry.
+The **Versions** tab (clock icon) lists the project's versions on the left, grouped by day. Every version goes on `main`: branches aren't in the UI for now (the core functions are still in the code, ready to be wired back).
+
+- **Click a version** to see its content as tables: presets, settings changed from the system presets (by process / filament / printer), one table per object (size, position, rotation, scale, per-object settings), one per plate, pauses and color changes per layer, and all settings (with a filter). Actions: **Compare with previous**, **Add tag…**, **Extract .3mf** (writes `<project>@<tag|sha>.3mf` next to the project, ready to open: that's how you restore a version).
+- **Ctrl+click a second version** (or *Compare with previous*) to compare: the same tables, only what differs, older and newer side by side. Next to each newer value: ▲ higher, ▼ lower, ● changed (not a number), + added, − removed.
+- Arrow keys move through the list.
+
+### Settings
+
+Plugins dialog → Config → **Versions**:
+- **Advanced mode** (off by default): shows version hashes, raw setting keys, the plugin's internal settings (`plugins`, `different_settings_to_system`, …), geometry file hashes and a **Raw diff** button in comparisons.
+
+The tab picks up a change when it gets focus again.
 
 ## Known issue: OrcaSlicer 2.5.0 skips the plugin on export
 
@@ -65,4 +74,6 @@ pip install dulwich && python test_orca_versioning.py
 - [ ] "Export G-code": a version with `Destination: file`. Slicing alone: no version.
 - [ ] Send to your printer: which `Destination:` appears.
 - [ ] Logs: `<data_dir>/log/python_*.log`, lines starting with `[orca-versioning]`.
+- [ ] The Versions tab shows the clock icon (if not: log line `icon failed`, falls back to OrcaSlicer's `print-time`).
+- [ ] Plugins dialog → Config → Versions shows the "Advanced mode" checkbox; toggling it changes the tab after it gets focus again.
 - [ ] Preset warning: with a process preset without "Version on export", a warning shows once (not on every slice) and the Versions tab shows the banner; picking a preset with it makes both go away.
