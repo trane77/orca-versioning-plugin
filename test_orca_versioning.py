@@ -124,4 +124,13 @@ with tempfile.TemporaryDirectory() as d:
     with ov.open_repo(half) as r:
         assert version(r, base, "t9") and ov.current_branch(r) == b"refs/heads/main"
 
+# preset check, with serialized values as OrcaSlicer reports them (see the G-code config block)
+ok_pipeline, ok_plugins = '"Version on export"', '"orca_versioning;;Version on export"'
+assert ov.preset_warning(ok_pipeline, ok_plugins) is None
+assert ov.preset_warning('"Version on export";"Other"', '"x;;Other";"orca_versioning;;Version on export"') is None
+assert "add" in ov.preset_warning("", "")                      # plugin not picked in the preset
+assert "add" in ov.preset_warning(None, None)                  # keys missing altogether
+assert "add" in ov.preset_warning('"Other"', ok_plugins)
+assert "OrcaSlicer bug" in ov.preset_warning(ok_pipeline, "")  # picked, but the manifest is empty
+
 print("ok")

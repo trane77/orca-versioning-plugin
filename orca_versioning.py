@@ -372,13 +372,46 @@ def _commit_snapshot(repo, project_path, dest, output):
             _page.post_message({"type": "refresh"})
 
 
+CAPABILITY = "Version on export"
+
+
+def preset_warning(pipeline, plugins):
+    """Why exporting to a file won't create a version with the active preset, or None if it will.
+
+    `pipeline` and `plugins` are the serialized `slicing_pipeline_plugin` and `plugins` values of the
+    active config (None if the key is missing).
+    """
+    if CAPABILITY not in (pipeline or ""):
+        return (f'G-code exports won\'t be versioned: add "{CAPABILITY}" to the process preset '
+                f"(Others > Slicing Pipeline Plugin) and save it as a user preset.")
+    if CAPABILITY not in (plugins or ""):  # OrcaSlicer 2.5.0 bug: manifest built before the plugin loaded
+        return (f'G-code exports won\'t be versioned (OrcaSlicer bug): in the process preset, remove '
+                f'"{CAPABILITY}" from Slicing Pipeline Plugin and add it back.')
+    return None
+
+
+_warning = None  # last preset warning shown, so each one is notified once, not on every slice
+
+
+def _check_preset():
+    """Notify when the active preset stops (or starts again) versioning exports. UI thread."""
+    global _warning
+    bundle = orca.host.preset_bundle()
+    w = preset_warning(bundle.full_config_value("slicing_pipeline_plugin"), bundle.full_config_value("plugins"))
+    if w and w != _warning:
+        orca.host.ui.push_notification(orca.host.ui.NotificationLevel.WarningNotificationLevel, f"Orca Versioning: {w}")
+    if w != _warning and _page is not None:
+        _page.post_message({"type": "refresh"})
+    _warning = w
+
+
 # ---------------------------------------------------------------- capabilities
 
 class VersionOnExport(orca.slicing.SlicingPipelineCapabilityBase if orca else object):
     """Add it to the process preset: it's the only hook for 'Export G-code' to a file."""
 
     def get_name(self):
-        return "Version on export"
+        return CAPABILITY
 
     def execute(self, ctx):
         try:
@@ -391,6 +424,8 @@ class VersionOnExport(orca.slicing.SlicingPipelineCapabilityBase if orca else ob
 
 
 PRINTER_EVENTS = ("PrintJobStarted", "SendJobStarted", "UploadStarted")
+# moments when the active preset may have changed; SlicingJobComplete comes right before an export
+PRESET_EVENTS = ("ProjectOpened", "NewProject", "PresetSelected", "PresetSaved", "SlicingJobComplete")
 
 
 class VersionsPage(orca.pages.PagesPluginCapabilityBase if orca else object):
@@ -425,12 +460,22 @@ class VersionsPage(orca.pages.PagesPluginCapabilityBase if orca else object):
                 self.post_message({"type": "refresh"})
         except Exception as e:
             _log(f"lifecycle {event} failed: {e!r}")
+        try:
+            if event in {getattr(orca.LifecycleEvent, n, None) for n in PRESET_EVENTS} - {None}:
+                _check_preset()
+        except Exception as e:
+            _log(f"preset check failed: {e!r}")
 
     def get_ui(self):
         return PAGE_HTML
 
     def on_message(self, data):  # UI thread
         cmd = data.get("cmd")
+        if cmd == "state":  # the page just opened or refreshed: the preset may not have fired any event yet
+            try:
+                _check_preset()
+            except Exception as e:
+                _log(f"preset check failed: {e!r}")
         try:
             with _lock:
                 repo, project_path = _current_repo()
@@ -454,6 +499,7 @@ class VersionsPage(orca.pages.PagesPluginCapabilityBase if orca else object):
         self.post_message({
             "type": "state",
             "project": project_path or "(project not saved)",
+            "warning": _warning,
             "history": history(repo),
         })
 
@@ -486,6 +532,7 @@ tr.sel{background:#09f2}
 pre{background:#8881;padding:8px;overflow:auto;max-height:50vh}
 .add{color:#080}.del{color:#c00}.hdr{opacity:.6}
 #err{color:#c00}
+#warn{background:#fc03;border-left:3px solid #e90;padding:6px 8px;margin-bottom:10px}
 </style></head><body>
 <header>
   <span id="project"></span>
@@ -493,6 +540,7 @@ pre{background:#8881;padding:8px;overflow:auto;max-height:50vh}
   <button id="extract" disabled>Extract .3mf</button>
   <button id="diff" disabled>Diff (2)</button>
 </header>
+<div id="warn" hidden></div>
 <div id="err"></div>
 <table id="hist"></table>
 <pre id="out" hidden></pre>
@@ -507,6 +555,8 @@ function buttons(){
 }
 function render(){
   $('project').textContent = state.project;
+  $('warn').hidden = !state.warning;
+  $('warn').textContent = state.warning || '';
   $('hist').innerHTML = state.history.map(function(c){
     var lines = c.message.split('\\n'), d = new Date(c.time*1000).toLocaleString();
     return '<tr data-sha="' + c.sha + '" class="' + (sel.indexOf(c.sha) >= 0 ? 'sel' : '') + '">' +

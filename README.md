@@ -23,8 +23,10 @@ git --git-dir <storage>/repos/<project>.git log --all --graph --oneline
 
 1. Copy `orca_versioning.py` into `<data_dir>/orca_plugins/orca_versioning/`.
 2. Restart OrcaSlicer and enable the plugin in the Plugins dialog. On first load, `uv` installs `dulwich`.
-3. **Add "Version on export" to the process preset** (option `slicing_pipeline_plugin`). Without this, exporting to a file isn't caught, because OrcaSlicer has no lifecycle event for file export. Sends to the printer (Bambu print/send, OctoPrint & co.) are caught anyway.
+3. **Add "Version on export" to the process preset** (Others > Slicing Pipeline Plugin, Advanced mode) and **save it as a user preset**. System presets can't be changed: an unsaved edit is lost, so every new project would need it again. With a user preset, new projects that use it are versioned with no extra step. Do this for every process preset you use. Without it, exporting to a file isn't caught: OrcaSlicer declares `GCodeExportStarted`/`GCodeExportFinished` but never fires them. Sends to the printer (Bambu print/send, OctoPrint & co.) are caught anyway.
    > A preset that references a plugin can't be sliced on a machine that doesn't have the plugin installed.
+
+If the active preset wouldn't version exports, the plugin says so: a warning notification (once per change, checked on project open/new, preset select/save and after each slice) and a banner in the Versions tab.
 
 ## Use
 
@@ -34,7 +36,7 @@ The **Versions** tab shows the project's history. Every version goes on `main`: 
 
 ## Known issue: OrcaSlicer 2.5.0 skips the plugin on export
 
-In OrcaSlicer 2.5.0 the preset's in-memory plugin manifest (`plugins`) can stay empty even though it's right on disk. It gets built before the plugin has finished loading and isn't rebuilt afterwards. The export then silently skips "Version on export", and no version is created. Signs:
+In OrcaSlicer 2.5.0 the preset's in-memory plugin manifest (`plugins`) can stay empty even though it's right on disk. It gets built before the plugin has finished loading and isn't rebuilt afterwards. The export then silently skips "Version on export", and no version is created. The plugin detects this and shows an "OrcaSlicer bug" warning. Other signs:
 - the exported G-code has `; plugins = ` (empty) next to `; slicing_pipeline_plugin = "Version on export"`;
 - the debug log has `Slicing Pipeline: no plugin reference found for capability 'Version on export'; skipping`.
 
@@ -63,3 +65,4 @@ pip install dulwich && python test_orca_versioning.py
 - [ ] "Export G-code": a version with `Destination: file`. Slicing alone: no version.
 - [ ] Send to your printer: which `Destination:` appears.
 - [ ] Logs: `<data_dir>/log/python_*.log`, lines starting with `[orca-versioning]`.
+- [ ] Preset warning: with a process preset without "Version on export", a warning shows once (not on every slice) and the Versions tab shows the banner; picking a preset with it makes both go away.
