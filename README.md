@@ -9,6 +9,10 @@ Each version holds:
 - `model.txt`: a readable summary of objects, parts, positions, rotations and scale.
 - `project.3mf`: a full copy of the project, **unsaved changes included** (via `export_3mf_copy`). Your project file is never touched.
 
+**Each plate has its own history.** Export and print always work on the plate selected in OrcaSlicer, so the version goes to that plate's history (branch `plate-<n>`) and holds only what concerns it: the global settings (shared by all plates), that plate's objects (positions, per-object settings, meshes), its `plate_<n>.json`, its filament sequence and its pauses/color changes. Editing plate 2 doesn't create a version of plate 1; a global setting change shows up in each plate's history at its next export. `project.3mf` stays whole, so extracting a version always restores the full project.
+
+A plate is identified by its **number**: if you delete or reorder plates, the history follows the number, not the content. Versions saved before plates had separate histories stay on `main`, shown as **Before plates** (all plates mixed, read-only).
+
 A new version is created only if at least one of these files changes. The `.3mf` alone doesn't count, because its bytes change on every export.
 
 While the project has never been saved, versions go into `untitled.git`. On the first save that history moves to the project. A *new project* sets `untitled` aside (`untitled-<date>.git`).
@@ -30,7 +34,7 @@ If the active preset wouldn't version exports, the plugin says so: a warning not
 
 ## Use
 
-The **Versions** tab (clock icon) lists the project's versions on the left, grouped by day. Every version goes on `main`: branches aren't in the UI for now (the core functions are still in the code, ready to be wired back).
+The **Versions** tab (clock icon) lists the versions on the left, grouped by day. With more than one plate, buttons above the list pick the plate history (with its version count; the dot marks the plate selected in OrcaSlicer). The tab follows the plate you select in OrcaSlicer; a plate picked by hand stays until OrcaSlicer's selection changes.
 
 - **Click a version** to see its content as tables: presets, settings changed from the system presets (by process / filament / printer), one table per object (size, position, rotation, scale, per-object settings), one per plate, pauses and color changes per layer, and all settings (with a filter). Actions: **Compare with previous**, **Add tag…**, **Extract .3mf** (writes `<project>@<tag|sha>.3mf` next to the project, ready to open: that's how you restore a version).
 - **Ctrl+click a second version** (or *Compare with previous*) to compare: the same tables, only what differs, older and newer side by side. Next to each newer value: ▲ higher, ▼ lower, ● changed (not a number), + added, − removed.
@@ -76,4 +80,6 @@ pip install dulwich && python test_orca_versioning.py
 - [ ] Logs: `<data_dir>/log/python_*.log`, lines starting with `[orca-versioning]`.
 - [ ] The Versions tab shows the clock icon (if not: log line `icon failed`, falls back to OrcaSlicer's `print-time`).
 - [ ] Plugins dialog → Config → Versions shows the "Advanced mode" checkbox; toggling it changes the tab after it gets focus again.
+- [ ] Two plates: export plate 1, then plate 2 → one version in each history, and the tab switches to the plate selected in OrcaSlicer (on `PlateSelected`, or when the tab gets focus again if that event isn't fired).
+- [ ] Moving an object on plate 2 and exporting plate 1 → no new plate 1 version.
 - [ ] Preset warning: with a process preset without "Version on export", a warning shows once (not on every slice) and the Versions tab shows the banner; picking a preset with it makes both go away.

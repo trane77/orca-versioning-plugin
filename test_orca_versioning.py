@@ -209,6 +209,86 @@ assert pick("layers") == {"Z 7.5 mm": (None, "Pause", "added"), "Z 5 mm": ("Paus
 assert "modified" not in cmp and "geometry" not in cmp  # meshes are the same
 assert ov.compare_view(project(base_settings), project(base_settings)) == []
 
+# ---- two plates: each has its own history (Cubo on plate 1, Cono on plate 2, as OrcaSlicer writes them)
+def two_plates(settings, cono_x=374, cono_mesh="<mesh v='cono'/>", cubo_loops="4", stamp="t"):
+    model = (
+        '<?xml version="1.0" encoding="UTF-8"?><model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+        'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06"><resources>'
+        '<object id="2" type="model"><components><component p:path="/3D/Objects/Cubo_1.model" objectid="1"/></components></object>'
+        '<object id="4" type="model"><components><component p:path="/3D/Objects/Cono_2.model" objectid="3"/></components></object>'
+        f'</resources><build><item objectid="2" transform="1 0 0 0 1 0 0 0 1 110 110 11"/>'
+        f'<item objectid="4" transform="1 0 0 0 1 0 0 0 1 {cono_x} 110 11"/></build></model>')
+    plate = lambda n, oid: (f'<plate><metadata key="plater_id" value="{n}"/><metadata key="plater_name" value="{"Cones" if n == 2 else ""}"/>'
+                            f'<model_instance><metadata key="object_id" value="{oid}"/><metadata key="instance_id" value="0"/>'
+                            '</model_instance></plate>')
+    entries = {
+        "Metadata/project_settings.config": json.dumps(settings),
+        "Metadata/model_settings.config":
+            f'<config><object id="2"><metadata key="name" value="Cubo"/><metadata key="wall_loops" value="{cubo_loops}"/></object>'
+            '<object id="4"><metadata key="name" value="Cono"/></object>' + plate(1, 2) + plate(2, 4) + '</config>',
+        "Metadata/plate_1.json": '{"bed_type":"hot_plate"}',
+        "Metadata/plate_2.json": '{"bed_type":"cool_plate"}',
+        "Metadata/filament_sequence.json": '{"plate_1":{"sequence":[]},"plate_2":{"sequence":[1]}}',
+        "Metadata/custom_gcode_per_layer.xml":
+            '<custom_gcodes_per_layer><plate><plate_info id="1"/><layer top_z="5" type="1"/></plate>'
+            '<plate><plate_info id="2"/><layer top_z="9" type="0" extruder="1" color="#FF0000"/></plate></custom_gcodes_per_layer>',
+        "Metadata/layer_heights_profile.txt": "object_id=1|0|0.2\nobject_id=2|0|0.1\n",
+        "3D/3dmodel.model": model,
+        "3D/Objects/Cubo_1.model": "<mesh v='cubo'/>",
+        "3D/Objects/Cono_2.model": cono_mesh,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.comment = stamp.encode()
+        for name, data in entries.items():
+            z.writestr(zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0)), data)
+    f = ov.files_from_3mf(buf.getvalue())
+    f["model.txt"] = (
+        "object 'Cubo' parts=1 facets=12\n  volume 'Cubo' size=(22.0, 22.0, 22.0)\n"
+        "  instance offset=(110.0, 110.0, 11.0) rot=(0.0, 0.0, 0.0) scale=(1.0, 1.0, 1.0) printable=True\n"
+        "object 'Cono' parts=1 facets=330\n  volume 'Cono' size=(22.0, 22.0, 22.0)\n"
+        f"  instance offset=({cono_x}.0, 110.0, 11.0) rot=(0.0, 0.0, 0.0) scale=(1.0, 1.0, 1.0) printable=True\n").encode()
+    return f
+
+
+s2 = {"layer_height": "0.2", "wall_loops": "2"}
+p1, p2 = ov.plate_files(two_plates(s2), 1), ov.plate_files(two_plates(s2), 2)
+assert "Cubo" in p1["model.txt"].decode() and "Cono" not in p1["model.txt"].decode()
+assert "Cono" in p2["model.txt"].decode() and "Cubo" not in p2["model.txt"].decode()
+assert "plate_2.json" not in p1 and "plate_1.json" not in p2 and p1["settings.ini"] == p2["settings.ini"]
+assert "Cono_2" not in p1["geometry.sha1"].decode() and "Cubo_1" in p1["geometry.sha1"].decode()
+assert json.loads(p2["filament_sequence.json"]) == {"plate_2": {"sequence": [1]}}
+assert b'top_z="9"' in p2["custom_gcode_per_layer.xml"] and b'top_z="5"' not in p2["custom_gcode_per_layer.xml"]
+assert p1["layer_heights_profile.txt"] == b"object_id=1|0|0.2\n"
+assert p1["project.3mf"] == p2["project.3mf"]  # extracting restores the whole project
+v2 = {s["id"]: s for s in ov.version_view(p2)}
+assert "object:Cono" in v2 and "object:Cubo" not in v2 and "plate:2" in v2 and "plate:1" not in v2, list(v2)
+assert rows(v2["plate:2"])["Objects"] == "Cono" and rows(v2["plate:2"])["Name"] == "Cones"
+assert rows(v2["layers"]) == {"Z 9 mm": "Color change — extruder 1 #FF0000"}
+
+with tempfile.TemporaryDirectory() as d:
+    with ov.open_repo(Path(d) / "two.git") as r:
+        ov.commit_version(r, {"settings.ini": b"old = 1\n"}, "Export old.gcode", {})  # pre-plates version, on main
+        commit = lambda plate, **kw: ov.commit_version(r, ov.plate_files(two_plates(s2, **kw), plate), "Export",
+                                                       {"Plate": str(plate)}, ref=ov.plate_ref(plate))
+        c1, c2 = commit(1), commit(2)
+        assert c1 and c2
+        # Cono moved, re-meshed: a plate 2 version, not a plate 1 one
+        assert commit(1, cono_x=300, cono_mesh="<mesh v='cono2'/>", stamp="t2") is None
+        c2b = commit(2, cono_x=300, cono_mesh="<mesh v='cono2'/>", stamp="t2")
+        assert c2b and "3D/Objects/Cono_2.model" in ov.diff(r, c2, c2b)
+        # Cubo's own setting: a plate 1 version only
+        assert commit(2, cono_x=300, cono_mesh="<mesh v='cono2'/>", cubo_loops="5") is None
+        assert commit(1, cono_x=300, cono_mesh="<mesh v='cono2'/>", cubo_loops="5")
+        # a global setting: each plate gets it on its next export
+        s2 = {**s2, "layer_height": "0.16"}
+        assert commit(2, cono_x=300, cono_mesh="<mesh v='cono2'/>", cubo_loops="5")
+        assert len(ov.history(r, "plate-1")) == 2 and len(ov.history(r, "plate-2")) == 3
+        lines = ov.plate_histories(r, current=3)  # plate 3 just created: listed, no versions yet
+        assert [(x["id"], x["count"], x["current"]) for x in lines] == [
+            ("plate-1", 2, False), ("plate-2", 3, False), ("plate-3", 0, True), ("main", 1, False)], lines
+        assert lines[1]["name"] == "Cones"
+
 # preset check, with serialized values as OrcaSlicer reports them (see the G-code config block)
 ok_pipeline, ok_plugins = '"Version on export"', '"orca_versioning;;Version on export"'
 assert ov.preset_warning(ok_pipeline, ok_plugins) is None

@@ -80,6 +80,149 @@ def files_from_3mf(data: bytes) -> dict:
     return files
 
 
+NS_3MF = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02",
+          "p": "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"}
+
+
+def _meta(el) -> dict:
+    return {m.get("key"): m.get("value", "") for m in el.findall("metadata")}
+
+
+def plate_files(files: dict, plate: int) -> dict:
+    """The part of a snapshot that belongs to one plate: what that plate's history versions.
+
+    Kept: the global settings, the plate's objects (model.txt, model_settings.config, their meshes in
+    geometry.sha1, layer height profiles), plate_<n>.json, its filament_sequence.json entry and its
+    pauses/color changes. Dropped: everything about the other plates, so editing them doesn't
+    create a version here. project.3mf stays whole: extracting a version restores the full project.
+
+    Objects are linked through model_settings.config: <plate plater_id> → model_instance object_id
+    → <object id> (same id as in 3D/3dmodel.model, whose components point at 3D/Objects/*.model).
+    """
+    try:
+        root = ET.fromstring(files["model_settings.config"])
+    except (KeyError, ET.ParseError):
+        return dict(files)
+    plates = root.findall("plate")
+    mine = next((p for i, p in enumerate(plates, 1) if _meta(p).get("plater_id", str(i)) == str(plate)), None)
+    if mine is None:
+        return dict(files)
+    keep = {}  # object id → instance indexes on this plate
+    for inst in mine.findall("model_instance"):
+        m = _meta(inst)
+        keep.setdefault(m.get("object_id"), set()).add(int(m.get("instance_id", "0") or 0))
+    objects = root.findall("object")
+    order = [(o.get("id"), _meta(o).get("name", "")) for o in objects]  # same order as model.txt
+    for o in objects:
+        if o.get("id") not in keep:
+            root.remove(o)
+    for p in plates:
+        if p is not mine:
+            root.remove(p)
+    for asm in root.findall("assemble"):
+        for item in asm.findall("assemble_item"):
+            if item.get("object_id") not in keep:
+                asm.remove(item)
+    out = dict(files)
+    out["model_settings.config"] = ET.tostring(root, encoding="utf-8")
+
+    if "model.txt" in files:
+        out["model.txt"] = _plate_model_txt(files["model.txt"].decode(errors="replace"), order, keep).encode()
+    if "geometry.sha1" in files:
+        out["geometry.sha1"] = _plate_geometry(files, keep).encode()
+
+    for name in list(out):
+        m = re.fullmatch(r"plate_(\d+)\.json", name)
+        if m and int(m.group(1)) != plate:
+            del out[name]
+    if "filament_sequence.json" in files:
+        try:
+            seq = json.loads(files["filament_sequence.json"])
+            seq = {k: v for k, v in seq.items() if k == f"plate_{plate}"}
+            out["filament_sequence.json"] = json.dumps(seq, separators=(",", ":")).encode()
+        except (ValueError, AttributeError):
+            pass
+    if "custom_gcode_per_layer.xml" in files:
+        try:
+            gc = ET.fromstring(files["custom_gcode_per_layer.xml"])
+            for p in gc.findall("plate"):
+                info = p.find("plate_info")
+                if (info.get("id", "1") if info is not None else "1") != str(plate):
+                    gc.remove(p)
+            out["custom_gcode_per_layer.xml"] = ET.tostring(gc, encoding="utf-8")
+        except ET.ParseError:
+            pass
+    if "layer_heights_profile.txt" in files:  # "object_id=<1-based object index>|z|h|…" per line
+        ids = [oid for oid, _ in order]
+        lines = [line for line in files["layer_heights_profile.txt"].decode(errors="replace").splitlines()
+                 if (m := re.match(r"object_id=(\d+)\|", line)) is None
+                 or (0 < int(m.group(1)) <= len(ids) and ids[int(m.group(1)) - 1] in keep)]
+        out["layer_heights_profile.txt"] = ("\n".join(lines) + "\n").encode()
+    return out
+
+
+def _plate_model_txt(text: str, order: list, keep: dict) -> str:
+    blocks = []  # [object line, volume lines…, instance lines…]
+    for line in text.splitlines():
+        if line.startswith("object "):
+            blocks.append([line])
+        elif blocks:
+            blocks[-1].append(line)
+    names = [o.get("name") for o in parse_model_txt(text)]
+    by_name = {}
+    for oid, name in order:
+        by_name.setdefault(name, oid)
+    out = []
+    for i, block in enumerate(blocks):
+        # model.txt and model_settings.config list objects in the same order; by name if they disagree
+        oid = order[i][0] if len(blocks) == len(order) else by_name.get(names[i])
+        if oid not in keep:
+            continue
+        n = -1
+        for line in block:
+            if line.lstrip().startswith("instance "):
+                n += 1
+                if n not in keep[oid]:
+                    continue
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _plate_geometry(files: dict, keep: dict) -> str:
+    """geometry.sha1 with only the plate's meshes; 3D/3dmodel.model hashed on the plate's part only."""
+    paths, model_hash = None, None
+    try:
+        with zipfile.ZipFile(io.BytesIO(files[BINARY])) as z:
+            model = ET.fromstring(z.read("3D/3dmodel.model"))
+        paths, parts = set(), []
+        for obj in model.iterfind("m:resources/m:object", NS_3MF):
+            if obj.get("id") in keep:
+                parts.append(ET.tostring(obj))
+                paths |= {c.get(f"{{{NS_3MF['p']}}}path", "").lstrip("/")
+                          for c in obj.iterfind("m:components/m:component", NS_3MF)}
+        for item in model.iterfind("m:build/m:item", NS_3MF):
+            if item.get("objectid") in keep:
+                parts.append(ET.tostring(item))
+        model_hash = hashlib.sha1(b"\n".join(parts)).hexdigest()
+    except (KeyError, ET.ParseError, zipfile.BadZipFile):
+        pass
+    lines = []
+    for line in files["geometry.sha1"].decode().splitlines():
+        h, sep, name = line.partition("  ")
+        if not sep:
+            continue
+        if name == "3D/3dmodel.model" and model_hash:
+            line = f"{model_hash}  {name}"
+        elif name.startswith("3D/Objects/") and paths is not None and name not in paths:
+            continue
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def plate_ref(plate: int) -> bytes:
+    return f"refs/heads/plate-{plate}".encode()
+
+
 def slug_for(project_path: str) -> str:
     if not project_path:
         return "untitled"
@@ -163,13 +306,14 @@ def changed_keys(old: dict, new: dict) -> list:
     return sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
 
 
-def commit_version(repo: Repo, files: dict, subject: str, trailers: dict):
-    """Commit `files` on the current branch. Returns the sha, or None if nothing changed.
+def commit_version(repo: Repo, files: dict, subject: str, trailers: dict, ref: bytes = None):
+    """Commit `files` on `ref` (default: the current branch). Returns the sha, or None if nothing changed.
 
     Only the text files decide whether something changed. The 3MF is rewritten with new timestamps
     on every export, so comparing it would create a version on every export.
     """
-    parent = head_sha(repo)
+    ref = ref or current_branch(repo)
+    parent = repo.refs[ref] if ref in repo.refs else None
     old = read_files(repo, parent)
     same = lambda n: old.get(n, b"") == files.get(n, b"")
     if parent is not None and all(same(n) for n in old.keys() | files.keys() if n != BINARY):
@@ -197,7 +341,7 @@ def commit_version(repo: Repo, files: dict, subject: str, trailers: dict):
     c.encoding = b"UTF-8"
     c.message = message.encode()
     repo.object_store.add_object(c)
-    repo.refs[current_branch(repo)] = c.id
+    repo.refs[ref] = c.id
     return c.id.decode()
 
 
@@ -227,6 +371,28 @@ def history(repo: Repo, branch: str = None) -> list:
             "tags": tags.get(e.commit.id.decode(), []),
             **parse_message(message),
         })
+    return out
+
+
+LEGACY = "main"  # versions saved before plates had their own history: all plates mixed, read-only
+
+
+def plate_histories(repo: Repo, current: int = None) -> list:
+    """The histories the Versions tab can show: one per plate (plate-<n>, the current plate even with no
+    versions yet), then the old mixed `main` if it has versions. [{id, plate, name, count, current}]"""
+    nums = {int(m.group(1)) for b in branches(repo) if (m := re.fullmatch(r"plate-(\d+)", b))}
+    if current:
+        nums.add(current)
+    out = []
+    for n in sorted(nums):
+        ref, name = plate_ref(n), ""
+        if ref in repo.refs:
+            plates = parse_model_settings(read_files(repo, repo.refs[ref]).get("model_settings.config", b""))["plates"]
+            name = plates[0]["meta"].get("plater_name", "") if plates else ""
+        out.append({"id": f"plate-{n}", "plate": n, "name": name, "current": n == current,
+                    "count": len(history(repo, f"plate-{n}"))})
+    if b"refs/heads/" + LEGACY.encode() in repo.refs:
+        out.append({"id": LEGACY, "plate": None, "name": "", "current": False, "count": len(history(repo, LEGACY))})
     return out
 
 
@@ -439,7 +605,8 @@ def version_view(files: dict, advanced: bool = False) -> list:
 
     names = {oid: o["name"] for oid, o in model["objects"].items()}
     plate_files = sorted((n for n in files if re.fullmatch(r"plate_\d+\.json", n)), key=lambda n: int(n[6:-5]))
-    plates = {str(i + 1): p for i, p in enumerate(model["plates"])}
+    # by plater_id: a plate's own history holds only that plate, which may not be plate 1
+    plates = {p["meta"].get("plater_id") or str(i + 1): p for i, p in enumerate(model["plates"])}
     for n in sorted(set(plates) | {f[6:-5] for f in plate_files}, key=int):
         rows, meta = [], plates.get(n, {}).get("meta", {})
         add = lambda k, label, v, num=None: rows.append(
@@ -650,6 +817,11 @@ def _current_repo():
     return open_repo(_storage() / "repos" / f"{slug_for(path)}.git"), path
 
 
+def _current_plate() -> int:
+    """The plate selected in OrcaSlicer, 1-based like the plate names and plate_<n>.json."""
+    return orca.host.model().current_plate_index() + 1
+
+
 def _log(msg):
     print(f"[orca-versioning] {msg}", file=sys.stderr)  # stderr is tee'd to <data_dir>/log/python_*.log
 
@@ -706,13 +878,18 @@ def _commit_snapshot(repo, project_path, dest, output):
     orca.host.plater().export_3mf_copy(str(tmp))  # unsaved changes included, project left untouched
     files = files_from_3mf(tmp.read_bytes())
     files["model.txt"] = model_summary()
+    # export and print always work on the selected plate: each plate has its own history
+    plate = _current_plate()
+    files = plate_files(files, plate)
     name = Path(output).name if output else "G-code"
     sha = commit_version(repo, files, f"{'Export' if dest == 'file' else 'Print'} {name}",
-                         {"Destination": dest, "Output": output, "Project": project_path or "(not saved)"})
+                         {"Destination": dest, "Output": output, "Project": project_path or "(not saved)",
+                          "Plate": str(plate)},
+                         ref=plate_ref(plate))
     if sha:
-        _log(f"committed {sha[:8]} ({dest})")
+        _log(f"committed {sha[:8]} on plate {plate} ({dest})")
         orca.host.ui.push_notification(orca.host.ui.NotificationLevel.RegularNotificationLevel,
-                                       f"Orca Versioning: version {sha[:8]} saved")
+                                       f"Orca Versioning: plate {plate} version {sha[:8]} saved")
         if _page is not None:
             _page.post_message({"type": "refresh"})
 
@@ -771,6 +948,8 @@ class VersionOnExport(orca.slicing.SlicingPipelineCapabilityBase if orca else ob
 PRINTER_EVENTS = ("PrintJobStarted", "SendJobStarted", "UploadStarted")
 # moments when the active preset may have changed; SlicingJobComplete comes right before an export
 PRESET_EVENTS = ("ProjectOpened", "NewProject", "PresetSelected", "PresetSaved", "SlicingJobComplete")
+# the Versions tab follows the plate selected in OrcaSlicer (on focus too, if these aren't fired)
+PLATE_EVENTS = ("PlateSelected", "PlateCreated", "PlateDeleted", "PlateRenamed")
 
 
 class VersionsPage(orca.pages.PagesPluginCapabilityBase if orca else object):
@@ -837,6 +1016,8 @@ class VersionsPage(orca.pages.PagesPluginCapabilityBase if orca else object):
             if event in (orca.LifecycleEvent.ProjectAfterSave, orca.LifecycleEvent.NewProject,
                          orca.LifecycleEvent.ProjectOpened):
                 self.post_message({"type": "refresh"})
+            if event in {getattr(orca.LifecycleEvent, n, None) for n in PLATE_EVENTS} - {None}:
+                self.post_message({"type": "plate"})
         except Exception as e:
             _log(f"lifecycle {event} failed: {e!r}")
         try:
@@ -885,12 +1066,18 @@ class VersionsPage(orca.pages.PagesPluginCapabilityBase if orca else object):
             out = extract_3mf(repo, data["sha"], base.with_name(f"{base.stem}@{label}.3mf"))
             orca.host.ui.push_notification(orca.host.ui.NotificationLevel.RegularNotificationLevel,
                                            f"Version extracted: {out}")
+        current = _current_plate()
+        lines = plate_histories(repo, current)
+        shown = data.get("plate") if data.get("plate") in {h["id"] for h in lines} else f"plate-{current}"
         self.post_message({
             "type": "state",
             "project": project_path or "(project not saved)",
             "warning": _warning,
             "advanced": advanced,
-            "history": history(repo),
+            "plates": lines,          # the histories to pick from
+            "current": f"plate-{current}",  # the plate selected in OrcaSlicer
+            "plate": shown,           # the history in `history`
+            "history": history(repo, shown),
         })
 
 
@@ -964,6 +1151,17 @@ code,.mono{font-family:Consolas,'Cascadia Mono',ui-monospace,monospace;font-size
 .side-head{padding:16px 16px 12px;border-bottom:1px solid var(--border)}
 .side-head h1{margin:0;font-size:15px;font-weight:600}
 .project{margin-top:2px;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.plates{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.plates:empty{display:none}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:14px;font-size:12px;
+  background:transparent;color:var(--fg);border:1px solid var(--border);max-width:100%}
+.pill:hover{background:var(--hover)}
+.pill.on{background:var(--selected);border-color:var(--accent)}
+.pill .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill .c{font-size:11px;color:var(--muted)}
+.pill .dot{width:6px;height:6px;border-radius:3px;background:var(--accent);flex:none}
+.pill.legacy{border-style:dashed}
+.note{margin:8px 8px 0;padding:8px 10px;border-radius:8px;font-size:12px;color:var(--muted);background:var(--surface)}
 .list{flex:1;overflow:auto;padding:6px 8px 12px;outline:none}
 .day{margin:12px 8px 4px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .ver{padding:9px 10px 10px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:2px}
@@ -1061,7 +1259,7 @@ pre.diff{margin:0;padding:12px 14px;overflow:auto;max-height:60vh;font-family:Co
 </style></head><body>
 <div class="app">
   <aside class="side">
-    <div class="side-head"><h1>Versions</h1><div class="project" id="project"></div></div>
+    <div class="side-head"><h1>Versions</h1><div class="project" id="project"></div><div class="plates" id="plates"></div></div>
     <div class="list" id="list" tabindex="0"></div>
     <div class="side-foot">Click to view a version · <b>Ctrl</b>+click a second one to compare</div>
   </aside>
@@ -1073,11 +1271,14 @@ pre.diff{margin:0;padding:12px 14px;overflow:auto;max-height:60vh;font-family:Co
 </div>
 <script>
 var state = null, sel = [], detail = null, filters = {}, open = {}, rawDiff = null, tagging = false;
+var pinned = null;  // the plate history picked here; null = follow the plate selected in OrcaSlicer
 var ARROWS = {up: '▲', down: '▼', changed: '●', added: '+', removed: '−'};
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
-function send(m){ orca.postMessage(m); }
+function send(m){ if (!('plate' in m)) m.plate = pinned; orca.postMessage(m); }
+function plateLabel(p){ return p.plate ? 'Plate ' + p.plate + (p.name ? ' · ' + p.name : '') : 'Before plates'; }
+function shown(){ return (state.plates || []).filter(function(p){ return p.id === state.plate; })[0]; }
 function byId(sha){ return (state && state.history || []).filter(function(v){ return v.sha === sha; })[0]; }
 function indexOf(sha){ return (state && state.history || []).map(function(v){ return v.sha; }).indexOf(sha); }
 function when(v, withDate){
@@ -1104,8 +1305,16 @@ function summary(v){ return v.summary ? v.summary.replace(/_/g, ' ') : (indexOf(
 function renderList(){
   $('project').textContent = state.project;
   $('project').title = state.project;
-  if (!state.history.length){ $('list').innerHTML = ''; return; }
-  var html = '', lastDay = null;
+  var plates = state.plates || [];
+  $('plates').innerHTML = plates.length > 1 ? plates.map(function(p){
+    var tip = p.plate ? (p.current ? 'Selected in OrcaSlicer' : 'Plate ' + p.plate + ' history') :
+      'Versions saved before each plate had its own history: all plates mixed';
+    return '<button class="pill' + (p.id === state.plate ? ' on' : '') + (p.plate ? '' : ' legacy') + '" data-plate="' +
+      esc(p.id) + '" title="' + esc(tip) + '">' + (p.current ? '<span class="dot"></span>' : '') +
+      '<span class="n">' + esc(plateLabel(p)) + '</span><span class="c">' + p.count + '</span></button>'; }).join('') : '';
+  var html = state.plate === 'main' ? '<div class="note">Saved before each plate had its own history: ' +
+    'these versions mix all plates. New versions go to the plate you export.</div>' : '', lastDay = null;
+  if (!state.history.length){ $('list').innerHTML = html; return; }
   state.history.forEach(function(v){
     var day = dayLabel(v);
     if (day !== lastDay){ html += '<div class="day">' + esc(day) + '</div>'; lastDay = day; }
@@ -1129,6 +1338,11 @@ $('list').onclick = function(e){
   else if (sel.indexOf(sha) >= 0) { if (sel.length > 1) sel.splice(sel.indexOf(sha), 1); }
   else sel = sel.length ? [sel[sel.length - 1], sha] : [sha];
   select();
+};
+$('plates').onclick = function(e){
+  var el = e.target.closest('[data-plate]'); if (!el) return;
+  pinned = el.dataset.plate === state.current ? null : el.dataset.plate;
+  send({cmd:'state'});
 };
 $('list').onkeydown = function(e){
   if (!state || !state.history.length || (e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
@@ -1199,7 +1413,10 @@ function renderDetail(){
   var el = $('detail');
   el.classList.remove('loading');
   if (!state.history.length){
-    el.innerHTML = placeholder('No versions yet', 'Export a G-code or send it to the printer: each time something changed, a version is saved here.');
+    var p = shown(), many = (state.plates || []).length > 1;
+    el.innerHTML = placeholder(many && p ? 'No versions of ' + plateLabel(p) + ' yet' : 'No versions yet',
+      'Export a G-code or send it to the printer: each time something changed, a version is saved here.' +
+      (many ? ' Each plate has its own history: the version goes to the plate you export.' : ''));
     return;
   }
   if (!detail || !sel.length){
@@ -1217,7 +1434,8 @@ function renderView(el){
   var v = byId(detail.sha); if (!v) return;
   var prev = state.history[indexOf(v.sha) + 1];
   var out = (v.trailers || {}).Output;
-  el.innerHTML = '<div class="head"><div style="min-width:0"><div class="kicker">Version · ' + esc(when(v, true)) + '</div>' +
+  var p = shown(), where = (state.plates || []).length > 1 && p ? plateLabel(p) + ' · ' : '';
+  el.innerHTML = '<div class="head"><div style="min-width:0"><div class="kicker">' + esc(where) + 'Version · ' + esc(when(v, true)) + '</div>' +
     '<h2>' + esc(title(v)) + '</h2><div class="meta"><span class="badge">' + esc(dest(v)) + '</span>' +
     v.tags.map(function(t){ return '<span class="badge tag">' + esc(t) + '</span>'; }).join('') +
     (state.advanced ? '<span class="badge sha">' + v.sha + '</span>' : '') +
@@ -1295,7 +1513,9 @@ $('detail').oninput = function(e){
 function showError(text){ $('err').hidden = !text; $('err').textContent = text || ''; }
 orca.onMessage(function(m){
   if (m.type === 'state'){
-    var first = state === null;
+    // another plate selected in OrcaSlicer: follow it, even if a history was picked here
+    if (state && pinned && m.current !== state.current){ pinned = null; send({cmd:'state'}); return; }
+    if (state && m.plate !== state.plate){ sel = []; detail = null; tagging = false; rawDiff = null; }
     state = m;
     $('warn').hidden = !m.warning; $('warn').textContent = m.warning || '';
     sel = sel.filter(function(s){ return byId(s); });
@@ -1306,6 +1526,7 @@ orca.onMessage(function(m){
     if (sel.length) select(); else renderDetail();
   }
   else if (m.type === 'refresh') send({cmd:'state'});
+  else if (m.type === 'plate'){ pinned = null; send({cmd:'state'}); }
   else if (m.type === 'error'){ showError(m.text); $('detail').classList.remove('loading'); }
   else if (m.type === 'view'){ if (sel.length === 1 && sel[0] === m.sha){ detail = m; renderDetail(); } }
   else if (m.type === 'compare'){ if (sel.length === 2 && sel.indexOf(m.a) >= 0 && sel.indexOf(m.b) >= 0){ detail = m; renderDetail(); } }
